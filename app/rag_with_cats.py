@@ -137,25 +137,33 @@ if _credentials_path.exists():
 
 _cats_auth_client = IAMAuthenticatedMCPClient(_CATS_BASE_URL)
 
+# Module-level client kept alive so tools retain auth headers across invocations.
+# Using async with would close the client after get_tools(), losing the config.
+_cats_mcp_client: MultiServerMCPClient | None = None
 
-async def _load_cats_mcp_tools() -> list:
-    """Open a transient MCP session to discover and return all tools from the Cats server."""
-    token = _cats_auth_client._get_identity_token()
-    async with MultiServerMCPClient({
-        "cats": {
-            "transport": "streamable_http",
-            "url": _CATS_MCP_URL,
-            "headers": {"Authorization": f"Bearer {token}"},
-        }
-    }) as client:
-        return await client.get_tools()
+
+def _get_cats_mcp_client() -> MultiServerMCPClient:
+    global _cats_mcp_client
+    if _cats_mcp_client is None:
+        token = _cats_auth_client._get_identity_token()
+        _cats_mcp_client = MultiServerMCPClient({
+            "cats": {
+                "transport": "streamable_http",
+                "url": _CATS_MCP_URL,
+                "headers": {"Authorization": f"Bearer {token}"},
+            }
+        })
+    return _cats_mcp_client
 
 
 @lru_cache(maxsize=1)
 def get_cats_mcp_tools() -> list:
     """Return MCP-discovered cat tools, loaded once and cached."""
+    async def _load():
+        return await _get_cats_mcp_client().get_tools()
+
     loop = asyncio.new_event_loop()
     try:
-        return loop.run_until_complete(_load_cats_mcp_tools())
+        return loop.run_until_complete(_load())
     finally:
         loop.close()
