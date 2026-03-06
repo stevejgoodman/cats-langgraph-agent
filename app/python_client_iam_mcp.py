@@ -57,12 +57,14 @@ class IAMAuthenticatedMCPClient:
             )
 
         try:
-            # Load credentials — prefer JSON string (cloud), fall back to file path (local)
+            # Use IDTokenCredentials to sign the ID token directly with the private key.
+            # This bypasses fetch_id_token() which relies on ADC/metadata server and
+            # fails in non-GCP cloud environments like LangGraph Cloud.
             if creds_json_str:
                 service_account_info = json.loads(creds_json_str)
-                credentials = service_account.Credentials.from_service_account_info(
+                id_token_credentials = service_account.IDTokenCredentials.from_service_account_info(
                     service_account_info,
-                    scopes=['https://www.googleapis.com/auth/cloud-platform']
+                    target_audience=self.service_url,
                 )
             else:
                 if not os.path.isfile(creds_path):
@@ -70,65 +72,15 @@ class IAMAuthenticatedMCPClient:
                         f"Service account key file not found: {creds_path}\n"
                         "Please verify the GOOGLE_APPLICATION_CREDENTIALS path is correct."
                     )
-                credentials = service_account.Credentials.from_service_account_file(
+                id_token_credentials = service_account.IDTokenCredentials.from_service_account_file(
                     creds_path,
-                    scopes=['https://www.googleapis.com/auth/cloud-platform']
+                    target_audience=self.service_url,
                 )
-            
-            # Create a request object for token fetching
+
             request = Request()
-            
-            # Refresh credentials if needed
-            if not credentials.valid:
-                credentials.refresh(request)
-            
-            # Verify this is a service account (not user credentials)
-            if not hasattr(credentials, 'service_account_email') or not credentials.service_account_email:
-                raise Exception(
-                    "The credentials file does not appear to be a service account key file.\n"
-                    "This client only supports service account key file authentication.\n"
-                    "Please ensure GOOGLE_APPLICATION_CREDENTIALS points to a valid service account JSON key file."
-                )
-            
-            # For IAM authentication, fetch an ID token with the service URL as audience
-            from google.oauth2 import id_token as oauth2_id_token
-            
-            try:
-                # fetch_id_token uses the service account private key to sign the token
-                self._id_token = oauth2_id_token.fetch_id_token(request, self.service_url)
-            except Exception as fetch_error:
-                # If fetch_id_token fails, try IAM Credentials API as fallback
-                service_account_email = credentials.service_account_email
-                try:
-                    # Refresh credentials to ensure we have a valid access token
-                    if not credentials.valid or credentials.token is None:
-                        credentials.refresh(request)
-                    
-                    iam_api_url = f"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{service_account_email}:generateIdToken"
-                    access_token = credentials.token
-                    headers = {
-                        "Authorization": f"Bearer {access_token}",
-                        "Content-Type": "application/json"
-                    }
-                    payload = {
-                        "audience": self.service_url,
-                        "includeEmail": True
-                    }
-                    response = requests.post(iam_api_url, headers=headers, json=payload, timeout=30)
-                    response.raise_for_status()
-                    result = response.json()
-                    self._id_token = result.get("token")
-                    if not self._id_token:
-                        raise Exception("Failed to obtain ID token from IAM API")
-                    return self._id_token
-                except Exception as iam_error:
-                    # Both methods failed - raise original error with helpful message
-                    raise Exception(
-                        f"Failed to generate ID token for service account: {fetch_error}\n"
-                        f"IAM Credentials API also failed: {iam_error}\n\n"
-                        "Ensure the service account key file is valid and the service account has permission to generate ID tokens."
-                    )
-            
+            id_token_credentials.refresh(request)
+            self._id_token = id_token_credentials.token
+
             if not self._id_token:
                 raise Exception("Failed to obtain ID token - token is None")
             
