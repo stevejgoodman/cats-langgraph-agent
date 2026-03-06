@@ -7,21 +7,14 @@ This module builds an in-memory RAG pipeline that:
 - Exposes a LangChain Tool `retrieve_information` that retrieves relevant
   context and generates a response constrained to that context.
 
-Additionally exposes three tools that call the Cats MCP server:
-- get_random_cats: fetch N random cat breeds with origin/traits/lifespan info
-- search_cat: look up a specific cat breed by name
-- get_cats_by_origin: list cat breeds by country or region of origin
-
-The MCP tools authenticate via a Google Cloud identity token obtained by
-calling `gcloud auth print-identity-token` or via service account credentials.
+Additionally exposes `get_cats_mcp_tools()` which dynamically discovers tools
+from the Cats MCP server using langchain-mcp-adapters. Tools are cached after
+first load. Authentication uses a GCP service account identity token.
 """
 from __future__ import annotations
 
-import json
+import asyncio
 import os
-import subprocess
-import urllib.error
-import urllib.request
 from functools import lru_cache
 from typing import Annotated, TypedDict
 
@@ -123,12 +116,11 @@ def retrieve_information(
 
 
 # ---------------------------------------------------------------------------
-# Cat MCP tools
+# Cat MCP tools — dynamically discovered via langchain-mcp-adapters
 # ---------------------------------------------------------------------------
 
-import json
-import urllib.request
 from pathlib import Path
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
 try:
     from .python_client_iam_mcp import IAMAuthenticatedMCPClient
@@ -138,93 +130,32 @@ except ImportError:
 _CATS_BASE_URL = "https://cats-mcp-660196542212.us-central1.run.app"
 _CATS_MCP_URL = f"{_CATS_BASE_URL}/mcp"
 
-# Resolve service account credentials relative to the project root
+# Resolve service account credentials relative to the project root (local dev)
 _credentials_path = Path(__file__).parent.parent / ".secrets" / "fionaa-service-acct.json"
 if _credentials_path.exists():
     os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", str(_credentials_path.resolve()))
 
-_cats_client = IAMAuthenticatedMCPClient(_CATS_BASE_URL)
+_cats_auth_client = IAMAuthenticatedMCPClient(_CATS_BASE_URL)
 
 
-def _call_cats_mcp(tool_name: str, arguments: dict) -> str:
-    """Open a fresh MCP session, call one tool, and return the result string.
-
-    Uses IAMAuthenticatedMCPClient for token acquisition, then manually drives
-    the MCP session protocol which requires:
-      1. An initialize request (returns mcp-session-id header)
-      2. A tools/call request with that session ID and
-         Accept: application/json, text/event-stream
-    """
-    token = _cats_client._get_identity_token()
-    base_headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
-
-    def _post(payload: dict, session_id: str | None = None) -> tuple[str | None, dict]:
-        headers = {**base_headers}
-        if session_id:
-            headers["mcp-session-id"] = session_id
-        data = json.dumps(payload).encode()
-        req = urllib.request.Request(_CATS_MCP_URL, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=15) as r:
-            sid = r.headers.get("mcp-session-id")
-            body = r.read().decode()
-        # SSE responses are prefixed with "event: message\ndata: ..."
-        for line in body.splitlines():
-            if line.startswith("data: "):
-                body = line[len("data: "):]
-                break
-        return sid, json.loads(body)
-
-    # 1. Initialize to get a session ID
-    session_id, _ = _post({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "langgraph-cats-agent", "version": "1.0"},
-        },
-    })
-
-    # 2. Call the tool within the session
-    _, response = _post(
-        {
-            "jsonrpc": "2.0", "id": 2,
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments},
-        },
-        session_id=session_id,
-    )
-
-    if "error" in response:
-        raise RuntimeError(f"MCP error from {tool_name}: {response['error']}")
-
-    content = response.get("result", {}).get("content", [])
-    texts = [block["text"] for block in content if block.get("type") == "text"]
-    return "\n".join(texts) if texts else json.dumps(response.get("result", {}))
+async def _load_cats_mcp_tools() -> list:
+    """Open a transient MCP session to discover and return all tools from the Cats server."""
+    token = _cats_auth_client._get_identity_token()
+    async with MultiServerMCPClient({
+        "cats": {
+            "transport": "streamable_http",
+            "url": _CATS_MCP_URL,
+            "headers": {"Authorization": f"Bearer {token}"},
+        }
+    }) as client:
+        return await client.get_tools()
 
 
-@tool
-def get_random_cats(
-    count: Annotated[int, "Number of random cat breeds to fetch (1-20, default 5)"] = 5,
-) -> str:
-    """Fetch random cat breeds with information about their origin, weight, lifespan, and traits."""
-    return _call_cats_mcp("get_random_cats", {"count": count})
-
-
-@tool
-def search_cat(
-    name: Annotated[str, "Cat breed name to search for, e.g. 'siamese', 'persian', 'maine coon'"],
-) -> str:
-    """Search for a specific cat breed by name and return detailed information including origin, traits, and image."""
-    return _call_cats_mcp("search_cat", {"name": name})
-
-
-@tool
-def get_cats_by_origin(
-    origin: Annotated[str, "Country or region to filter by, e.g. 'egypt', 'united states', 'japan'"],
-) -> str:
-    """Get a list of cat breeds filtered by country or region of origin with their traits."""
-    return _call_cats_mcp("get_cats_by_origin", {"origin": origin})
+@lru_cache(maxsize=1)
+def get_cats_mcp_tools() -> list:
+    """Return MCP-discovered cat tools, loaded once and cached."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_load_cats_mcp_tools())
+    finally:
+        loop.close()
