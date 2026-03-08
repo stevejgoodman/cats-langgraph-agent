@@ -119,6 +119,7 @@ def retrieve_information(
 # Cat MCP tools — dynamically discovered via langchain-mcp-adapters
 # ---------------------------------------------------------------------------
 
+import httpx
 from pathlib import Path
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
@@ -137,40 +138,43 @@ if _credentials_path.exists():
 
 _cats_auth_client = IAMAuthenticatedMCPClient(_CATS_BASE_URL)
 
-# Module-level client and tools kept alive so tools retain auth headers across invocations.
-# Both are invalidated together when the token expires (GCP tokens last ~1 hour).
-_cats_mcp_client: MultiServerMCPClient | None = None
-_cats_mcp_tools_cache: list | None = None
+
+class _DynamicGCPAuth(httpx.Auth):
+    """httpx Auth that injects a fresh GCP identity token on every request.
+
+    Because this is called per-request, the token is always checked for expiry
+    (via IAMAuthenticatedMCPClient._get_identity_token) before being used.
+    This means the MCP client and its tools can be cached indefinitely — there
+    is no static token that can go stale.
+    """
+
+    def __init__(self, auth_client: IAMAuthenticatedMCPClient) -> None:
+        self._auth_client = auth_client
+
+    def auth_flow(self, request: httpx.Request):
+        token = self._auth_client._get_identity_token()
+        request.headers["Authorization"] = f"Bearer {token}"
+        yield request
 
 
-def _get_cats_mcp_client() -> MultiServerMCPClient:
-    global _cats_mcp_client, _cats_mcp_tools_cache
-    if _cats_mcp_client is not None and _cats_auth_client._token_is_expired():
-        _cats_mcp_client = None
-        _cats_mcp_tools_cache = None
-    if _cats_mcp_client is None:
-        token = _cats_auth_client._get_identity_token()
-        _cats_mcp_client = MultiServerMCPClient({
-            "cats": {
-                "transport": "streamable_http",
-                "url": _CATS_MCP_URL,
-                "headers": {"Authorization": f"Bearer {token}"},
-            }
-        })
-    return _cats_mcp_client
+# Module-level client kept alive; auth is refreshed dynamically per request.
+_cats_mcp_client = MultiServerMCPClient({
+    "cats": {
+        "transport": "streamable_http",
+        "url": _CATS_MCP_URL,
+        "auth": _DynamicGCPAuth(_cats_auth_client),
+    }
+})
 
 
+@lru_cache(maxsize=1)
 def get_cats_mcp_tools() -> list:
-    """Return MCP-discovered cat tools, refreshing if the auth token has expired."""
-    global _cats_mcp_tools_cache
-    client = _get_cats_mcp_client()
-    if _cats_mcp_tools_cache is None:
-        async def _load():
-            return await client.get_tools()
+    """Return MCP-discovered cat tools, loaded once and cached."""
+    async def _load():
+        return await _cats_mcp_client.get_tools()
 
-        loop = asyncio.new_event_loop()
-        try:
-            _cats_mcp_tools_cache = loop.run_until_complete(_load())
-        finally:
-            loop.close()
-    return _cats_mcp_tools_cache
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_load())
+    finally:
+        loop.close()
