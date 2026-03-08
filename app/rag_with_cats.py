@@ -137,13 +137,17 @@ if _credentials_path.exists():
 
 _cats_auth_client = IAMAuthenticatedMCPClient(_CATS_BASE_URL)
 
-# Module-level client kept alive so tools retain auth headers across invocations.
-# Using async with would close the client after get_tools(), losing the config.
+# Module-level client and tools kept alive so tools retain auth headers across invocations.
+# Both are invalidated together when the token expires (GCP tokens last ~1 hour).
 _cats_mcp_client: MultiServerMCPClient | None = None
+_cats_mcp_tools_cache: list | None = None
 
 
 def _get_cats_mcp_client() -> MultiServerMCPClient:
-    global _cats_mcp_client
+    global _cats_mcp_client, _cats_mcp_tools_cache
+    if _cats_mcp_client is not None and _cats_auth_client._token_is_expired():
+        _cats_mcp_client = None
+        _cats_mcp_tools_cache = None
     if _cats_mcp_client is None:
         token = _cats_auth_client._get_identity_token()
         _cats_mcp_client = MultiServerMCPClient({
@@ -156,14 +160,17 @@ def _get_cats_mcp_client() -> MultiServerMCPClient:
     return _cats_mcp_client
 
 
-@lru_cache(maxsize=1)
 def get_cats_mcp_tools() -> list:
-    """Return MCP-discovered cat tools, loaded once and cached."""
-    async def _load():
-        return await _get_cats_mcp_client().get_tools()
+    """Return MCP-discovered cat tools, refreshing if the auth token has expired."""
+    global _cats_mcp_tools_cache
+    client = _get_cats_mcp_client()
+    if _cats_mcp_tools_cache is None:
+        async def _load():
+            return await client.get_tools()
 
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(_load())
-    finally:
-        loop.close()
+        loop = asyncio.new_event_loop()
+        try:
+            _cats_mcp_tools_cache = loop.run_until_complete(_load())
+        finally:
+            loop.close()
+    return _cats_mcp_tools_cache

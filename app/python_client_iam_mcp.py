@@ -10,9 +10,11 @@ Usage with Service Account Key File:
     python python_client_iam_mcp.py
 """
 
+import base64
 import json
 import os
 import sys
+import time
 from typing import Any, Dict
 
 try:
@@ -34,7 +36,21 @@ class IAMAuthenticatedMCPClient:
         # Remove trailing slash to avoid double slashes in URLs
         self.service_url = service_url.rstrip('/')
         self._id_token = None
-    
+
+    def _token_is_expired(self) -> bool:
+        """Return True if the cached token is missing or expires within 5 minutes."""
+        if not self._id_token:
+            return True
+        try:
+            parts = self._id_token.split('.')
+            if len(parts) < 2:
+                return True
+            padded = parts[1] + '=' * (-len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded))
+            return time.time() > payload.get('exp', 0) - 300
+        except Exception:
+            return True
+
     def _get_identity_token(self) -> str:
         """Get or refresh identity token for the service using service account credentials.
 
@@ -43,7 +59,7 @@ class IAMAuthenticatedMCPClient:
            Set this in cloud environments (e.g. LangGraph Cloud) where file paths are unavailable.
         2. GOOGLE_APPLICATION_CREDENTIALS — path to a service account key file (local dev default).
         """
-        if self._id_token:
+        if not self._token_is_expired():
             return self._id_token
 
         creds_json_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
